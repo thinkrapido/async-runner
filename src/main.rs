@@ -1,88 +1,95 @@
 
-#![feature(async_closure)]
-
-use {
-    std::{
-        io::Error,
-        future::Future,
-        collections::VecDeque,
-        time::Duration,
-    },
-    tokio::{
-        task::JoinHandle,
-        spawn,
-        time::sleep,
-    },
+use std::sync::{Arc, RwLock};
+use anyhow::Result;
+use anyhow::anyhow;
+use tokio::task::JoinSet;
+use tokio::signal::ctrl_c;
+use std::time::Duration;
+use futures::{
+    select,
+    FutureExt,
+    pin_mut,
 };
 
-struct AsyncHandle {
-    pub handle: JoinHandle<()>,
+#[derive(Clone)]
+pub struct AsyncRunner {
+    state: Arc<AsyncRunnerState>,
 }
-impl AsyncHandle {
-    pub fn new(handle: JoinHandle<()>) -> Self {
-        AsyncHandle { handle }
-    }
-}
-
-struct AsyncRunner {
-    ring: VecDeque<AsyncHandle>,
-    running: bool,
-}
-
 impl AsyncRunner {
-
-    fn new() -> Self {
-        AsyncRunner {
-            ring: VecDeque::new(),
-            running: false,
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AsyncRunnerState::default()),
         }
     }
+    pub async fn run(self) -> Result<()> {
 
-    pub fn is_running(&self) -> bool { self.running }
+        let premature_exit = async {
+            ctrl_c().await.expect("failed to listen for event");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }.fuse();
 
-    pub fn add<F, Fut>(&mut self, afun: F) 
-        where F: Fn(&mut AsyncRunner) -> Fut, Fut: Future<Output = ()> + Send + 'static
+        let mut bla = self.state.set.write().unwrap();
+        let set = bla.join_next().fuse();
+
+        pin_mut!(set, premature_exit);
+
+        select!{
+            _ = set => (),
+            _ = premature_exit => (),
+        }
+
+        Ok(())
+    }
+
+    pub fn spawn<T>(&self, a: fn(app: AsyncRunner) -> T)
+        where
+            T: std::future::Future<Output =()> + Send + 'static,
     {
-        self.running = true;
-        self.ring.push_back(AsyncHandle::new(spawn(afun(self))))
+        let _ = self.state.set.write().unwrap().spawn(a(self.clone()));
     }
+    pub fn is_running(&self) -> bool {
+        *self.state.is_running.read().unwrap()
+    }
+    pub fn stop(&self) {
+        *self.state.is_running.write().unwrap() = false;
+    }
+}
 
-    pub async fn run(&mut self) {
-        while let Some(ahandle) = self.ring.pop_front() {
-            let _ = ahandle.handle.await;
+struct AsyncRunnerState {
+    set: RwLock<JoinSet<()>>,
+    is_running: RwLock<bool>,
+}
+impl Default for AsyncRunnerState {
+    fn default() -> Self {
+        Self {
+            set: RwLock::new(JoinSet::<()>::new()),
+            is_running: RwLock::new(true),
         }
     }
-
 }
 
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<()> {
 
-    let mut r = AsyncRunner::new();
+    let app = AsyncRunner::new();
 
-    r.add(a1);
-    //r.add(a2);
+    app.spawn(|app1: AsyncRunner| async move {
+        let mut n = 1;
+        while app1.is_running() {
+            println!("{}", n);
+            n += 1;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    });    
 
-    r.run().await;
+    app.spawn(|app1: AsyncRunner| async move {
+        tokio::time::sleep(Duration::from_millis(10000)).await;
+        app1.stop();
+    });    
+
+    app.run().await?;
 
     Ok(())
-}
-
-async fn a1(runner: &mut AsyncRunner) {
-    let mut i = 10;
-    while i > 0 {
-        sleep(Duration::from_millis(250)).await;
-        println!("a1: {}", i);
-        i -= 1;
-    }
-}
-async fn a2(runner: &mut AsyncRunner) {
-    let mut i = 5;
-    while i > 0 {
-        sleep(Duration::from_millis(100)).await;
-        println!("a2: {}", i);
-        i -= 1;
-    }
 }
 
